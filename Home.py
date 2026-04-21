@@ -1,0 +1,885 @@
+import cv2
+import numpy as np
+import customtkinter as ctk
+from PIL import Image, ImageTk
+from ultralytics import YOLO
+import threading, time, os
+import pyttsx3   # <-- NEW: for voice ale rts
+
+# ===================== CONFIG =====================
+
+FRAME_W, FRAME_H = 1366, 700
+
+# Models (put in same folder)
+MAIN_MODEL_PATH    = "yolov8n.pt"       # Ultralytics official COCO model
+SIGNS_MODEL_PATH   = "traffic_signs.pt" # optional
+POTHOLE_MODEL_PATH = "pothole.pt"       # optional
+ZEBRA_MODEL_PATH   = "zebra.pt"         # optional
+
+HUD_BG_PATH        = "hud_bg.png"       # optional HUD background
+
+LANE_WIDTH_M       = 3.7                # approximate lane width
+CONF_MAIN          = 0.35
+CONF_OTHER         = 0.35
+
+# Speed estimation scale (tune for your camera)
+SPEED_SCALE_KMH = 2.5   # bigger = higher reported speed
+
+
+# ===================== MODEL LOADING =====================
+
+def safe_load_model(path, name):
+    if os.path.exists(path):
+        try:
+            print(f"[INFO] Loading {name}: {path}")
+            return YOLO(path)
+        except Exception as e:
+            print(f"[WARN] Failed to load {name}: {e}")
+    else:
+        print(f"[WARN] {name} file not found: {path}")
+    return None
+
+yolo_main    = safe_load_model(MAIN_MODEL_PATH, "Main model")
+yolo_signs   = safe_load_model(SIGNS_MODEL_PATH, "Signs model")
+yolo_pothole = safe_load_model(POTHOLE_MODEL_PATH, "Pothole model")
+yolo_zebra   = safe_load_model(ZEBRA_MODEL_PATH, "Zebra model")
+
+# ===================== VOICE ENGINE (pyttsx3) =====================
+
+engine = pyttsx3.init()
+engine.setProperty('rate', 165)
+
+# Try to pick a female Indian-ish voice if available
+try:
+    voices = engine.getProperty('voices')
+    chosen_voice = None
+    for v in voices:
+        name_low = v.name.lower()
+        if "female" in name_low and ("india" in name_low or "indian" in name_low or "hindi" in name_low):
+            chosen_voice = v.id
+            break
+    if chosen_voice is None and len(voices) > 1:
+        chosen_voice = voices[1].id  # fallback: second voice
+    if chosen_voice is not None:
+        engine.setProperty('voice', chosen_voice)
+except Exception as e:
+    print("[WARN] Could not set specific voice:", e)
+
+last_alert_time = 0
+alert_cooldown = 3   # seconds between any two alerts
+
+
+def _speak_bg(text):
+    """Background worker for speaking (so GUI doesn't freeze)."""
+    try:
+        engine.say(text)
+        engine.runAndWait()
+    except Exception as e:
+        print("[WARN] TTS error:", e)
+
+
+def speak_alert(msg):
+    """Non-blocking alert with global cooldown."""
+    global last_alert_time
+    now = time.time()
+    if now - last_alert_time < alert_cooldown:
+        return
+    last_alert_time = now
+
+    thr = threading.Thread(target=_speak_bg, args=(msg,))
+    thr.daemon = True
+    thr.start()
+
+#zebra crossing
+def detect_zebra(frame):
+    h, w = frame.shape[:2]
+
+    # Focus on road region (bottom half)
+    roi = frame[int(h*0.55):h, :]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Extract bright (white) regions
+    _, thresh = cv2.threshold(blur, 200, 255, cv2.THRESH_BINARY)
+
+    # Morphology to connect stripes
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 5))
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(
+        morph, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    zebra_stripes = 0
+
+    for c in contours:
+        x, y, w1, h1 = cv2.boundingRect(c)
+        aspect_ratio = w1 / float(h1 + 1)
+
+        # Zebra stripe conditions
+        if w1 > 120 and h1 < 40 and aspect_ratio > 4:
+            zebra_stripes += 1
+            cv2.rectangle(
+                roi, (x, y), (x + w1, y + h1),
+                (255, 255, 0), 2
+            )
+
+    zebra_found = zebra_stripes >= 3  # need multiple stripes
+
+    # Put ROI back
+    frame[int(h*0.55):h, :] = roi
+
+    return frame, zebra_found
+
+# ===================== LANE DETECTION =====================
+
+def lane_color_filter(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    yellow = cv2.inRange(hsv, (15, 80, 80), (35, 255, 255))
+    white  = cv2.inRange(hsv, (0, 0, 180), (255, 70, 255))
+    return cv2.bitwise_or(yellow, white)
+
+def lane_perspective_transform(img):
+    h, w = img.shape[:2]
+    src = np.float32([
+        [w * 0.45, h * 0.63],
+        [w * 0.55, h * 0.63],
+        [w * 0.10, h * 0.98],
+        [w * 0.90, h * 0.98],
+    ])
+    dst = np.float32([
+        [200, 0], [w - 200, 0],
+        [200, h], [w - 200, h]
+    ])
+    M    = cv2.getPerspectiveTransform(src, dst)
+    Minv = cv2.getPerspectiveTransform(dst, src)
+    warped = cv2.warpPerspective(img, M, (w, h))
+    return warped, Minv
+
+def lane_find_pixels(binary_warped):
+    histogram = np.sum(binary_warped[binary_warped.shape[0] // 2:, :], axis=0)
+    midpoint  = histogram.shape[0] // 2
+    leftx_base  = np.argmax(histogram[:midpoint])
+    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+
+    nwindows      = 9
+    window_height = binary_warped.shape[0] // nwindows
+    nonzero = binary_warped.nonzero()
+    nonzeroy, nonzerox = np.array(nonzero[0]), np.array(nonzero[1])
+
+    margin = 80
+    minpix = 50
+
+    left_inds = []
+    right_inds = []
+    leftx_current  = leftx_base
+    rightx_current = rightx_base
+
+    for window in range(nwindows):
+        wy_low  = binary_warped.shape[0] - (window + 1) * window_height
+        wy_high = binary_warped.shape[0] - window * window_height
+
+        wx_left_low  = leftx_current - margin
+        wx_left_high = leftx_current + margin
+        wx_right_low  = rightx_current - margin
+        wx_right_high = rightx_current + margin
+
+        good_left_inds = ((nonzeroy >= wy_low) & (nonzeroy < wy_high) &
+                          (nonzerox >= wx_left_low) & (nonzerox < wx_left_high)).nonzero()[0]
+        good_right_inds = ((nonzeroy >= wy_low) & (nonzeroy < wy_high) &
+                           (nonzerox >= wx_right_low) & (nonzerox < wx_right_high)).nonzero()[0]
+
+        left_inds.append(good_left_inds)
+        right_inds.append(good_right_inds)
+
+        if len(good_left_inds) > minpix:
+            leftx_current = int(np.mean(nonzerox[good_left_inds]))
+        if len(good_right_inds) > minpix:
+            rightx_current = int(np.mean(nonzerox[good_right_inds]))
+
+    left_inds  = np.concatenate(left_inds)
+    right_inds = np.concatenate(right_inds)
+
+    leftx  = nonzerox[left_inds]
+    lefty  = nonzeroy[left_inds]
+    rightx = nonzerox[right_inds]
+    righty = nonzeroy[right_inds]
+    return leftx, lefty, rightx, righty
+
+def lane_pipeline(frame):
+    """
+    Returns:
+      lane_frame, steering ('Left/Right/Straight'), curve_label, offset_m
+    """
+    mask = lane_color_filter(frame)
+    warped, Minv = lane_perspective_transform(mask)
+    lx, ly, rx, ry = lane_find_pixels(warped)
+
+    if len(lx) == 0 or len(rx) == 0:
+        return frame, "Unknown", "Unknown", None
+
+    h, w = warped.shape[:2]
+    left_fit  = np.polyfit(ly, lx, 2)
+    right_fit = np.polyfit(ry, rx, 2)
+    ploty = np.linspace(0, h - 1, h)
+
+    left_x  = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
+    right_x = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
+
+    warp_zero  = np.zeros_like(warped).astype(np.uint8)
+    color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+
+    pts_left  = np.array([np.transpose(np.vstack([left_x, ploty]))])
+    pts_right = np.array([np.flipud(np.transpose(np.vstack([right_x, ploty])))]
+                         )
+    pts = np.hstack((pts_left, pts_right))
+
+    cv2.fillPoly(color_warp, np.int32([pts]), (0, 255, 0))
+
+    center_x = (left_x + right_x) / 2
+    path_pts = np.array([np.transpose(np.vstack([center_x, ploty]))]).astype(np.int32)
+    cv2.polylines(color_warp, path_pts, isClosed=False, color=(255, 0, 255), thickness=10)
+
+    lane_overlay = cv2.warpPerspective(color_warp, Minv, (frame.shape[1], frame.shape[0]))
+    result = cv2.addWeighted(frame, 1, lane_overlay, 0.4, 0)
+
+    # metrics
+    y_bottom = h - 1
+    y_mid    = int(h * 0.5)
+
+    lane_center_bottom = (left_fit[0]*y_bottom**2 + left_fit[1]*y_bottom + left_fit[2] +
+                          right_fit[0]*y_bottom**2 + right_fit[1]*y_bottom + right_fit[2]) / 2
+    lane_center_mid    = (left_fit[0]*y_mid**2 + left_fit[1]*y_mid + left_fit[2] +
+                          right_fit[0]*y_mid**2 + right_fit[1]*y_mid + right_fit[2]) / 2
+
+    car_center = frame.shape[1] / 2
+    lane_width_px = right_x[-1] - left_x[-1]
+    px_per_m = lane_width_px / LANE_WIDTH_M
+    offset_m = (car_center - lane_center_bottom) / px_per_m
+
+    drift = lane_center_mid - lane_center_bottom
+    steering = "Straight"
+    if drift < -25:
+        steering = "Left"
+    elif drift > 25:
+        steering = "Right"
+
+    curve_label = "Straight"
+    if abs(drift) > 35:
+        curve_label = f"Sharp {steering}"
+    elif abs(drift) > 20:
+        curve_label = f"Gentle {steering}"
+
+    # car center ref
+    h2, w2 = frame.shape[:2]
+    cv2.line(result, (int(car_center), h2),
+             (int(car_center), int(h2*0.7)), (255, 0, 0), 2)
+    cv2.circle(result, (int(car_center), int(h2*0.9)), 6, (255,255,255), -1)
+
+    return result, steering, curve_label, offset_m
+
+
+# ===================== YOLO DETECTIONS =====================
+
+def detect_main_objects(frame):
+    """
+    From main YOLO: vehicles, pedestrians, traffic lights.
+    Also returns close_vehicle flag for collision flash.
+    """
+    counts = {"vehicles": 0, "pedestrians": 0}
+    tl_boxes = []
+    close_vehicle = False
+
+    if yolo_main is None:
+        return frame, counts, tl_boxes, close_vehicle
+
+    results = yolo_main(frame, conf=CONF_MAIN, verbose=False)[0]
+    for box in results.boxes:
+        cls_id   = int(box.cls)
+        cls_name = yolo_main.names[cls_id]
+        x1,y1,x2,y2 = box.xyxy[0].cpu().numpy().astype(int)
+
+        if cls_name in ["car", "truck", "bus", "motorbike", "motorcycle", "bicycle"]:
+            counts["vehicles"] += 1
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,190,255), 2)
+            cv2.putText(frame, cls_name, (x1, max(20,y1-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,190,255), 2)
+
+            # Collision heuristic: big & near bottom
+            h_box = y2 - y1
+            if h_box > FRAME_H * 0.45 and y2 > FRAME_H * 0.7:
+                close_vehicle = True
+
+        elif cls_name == "person":
+            counts["pedestrians"] += 1
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,128), 2)
+            cv2.putText(frame, "person", (x1, max(20,y1-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,128), 2)
+
+        elif cls_name == "traffic light":
+            tl_boxes.append((x1,y1,x2,y2))
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,255), 2)
+
+    return frame, counts, tl_boxes, close_vehicle
+
+def classify_tl_state(frame, boxes):
+    state = "NONE"
+    for (x1,y1,x2,y2) in boxes:
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            continue
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+        red1 = cv2.inRange(hsv, (0,120,100), (10,255,255))
+        red2 = cv2.inRange(hsv, (160,120,100), (179,255,255))
+        red  = cv2.bitwise_or(red1, red2)
+        red_area = cv2.countNonZero(red)
+
+        yellow = cv2.inRange(hsv, (20,120,100), (35,255,255))
+        yellow_area = cv2.countNonZero(yellow)
+
+        green = cv2.inRange(hsv, (40,60,80), (90,255,255))
+        green_area = cv2.countNonZero(green)
+
+        max_color = max(red_area, yellow_area, green_area)
+        if max_color < 50:
+            continue
+
+        if max_color == red_area:
+            state = "RED"
+        elif max_color == yellow_area and state != "RED":
+            state = "YELLOW"
+        elif max_color == green_area and state not in ["RED","YELLOW"]:
+            state = "GREEN"
+    return state
+
+def detect_potholes(frame):
+    h, w = frame.shape[:2]
+    roi = frame[int(h*0.6):h, :]
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7,7), 0)
+
+    edges = cv2.Canny(blur, 40, 120)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    pothole_found = False
+    for c in contours:
+        area = cv2.contourArea(c)
+        if 800 < area < 20000:
+            x,y,w1,h1 = cv2.boundingRect(c)
+            aspect = w1 / float(h1+1)
+            if 0.5 < aspect < 2.5:
+                pothole_found = True
+                cv2.rectangle(roi, (x,y), (x+w1,y+h1), (0,128,255), 2)
+
+    frame[int(h*0.6):h, :] = roi
+    return frame, pothole_found
+
+
+
+
+def detect_signs(frame):
+    signs = []
+    if yolo_signs is None:
+        return frame, signs
+
+    results = yolo_signs(frame, conf=CONF_OTHER, verbose=False)[0]
+    for box in results.boxes:
+        x1,y1,x2,y2 = box.xyxy[0].cpu().numpy().astype(int)
+        cls_id   = int(box.cls)
+        cls_name = yolo_signs.names[cls_id]
+        signs.append(cls_name)
+        cv2.rectangle(frame, (x1,y1), (x2,y2), (255,140,0), 2)
+        cv2.putText(frame, cls_name, (x1, max(20,y1-5)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,140,0), 2)
+    return frame, signs
+
+
+# ===================== CONGESTION LEVEL =====================
+
+def get_congestion_level(vehicle_count):
+    if vehicle_count >= 10:
+        return "HIGH"
+    elif vehicle_count >= 5:
+        return "MEDIUM"
+    elif vehicle_count >= 1:
+        return "LOW"
+    return "CLEAR"
+
+
+# ===================== SPEED ESTIMATION =====================
+
+prev_gray = None
+prev_time = None
+
+def estimate_speed_kmh(frame):
+    """
+    Very rough monocular ego-speed estimate using optical flow
+    in center-bottom region. This is an approximation.
+    """
+    global prev_gray, prev_time
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    now = time.time()
+
+    if prev_gray is None or prev_time is None:
+        prev_gray = gray
+        prev_time = now
+        return 0.0
+
+    dt = now - prev_time
+    if dt <= 0:
+        dt = 1e-3
+
+    h, w = gray.shape[:2]
+    # ROI: lower center, where road texture moves
+    x1, y1 = int(w*0.3), int(h*0.6)
+    x2, y2 = int(w*0.7), int(h*0.95)
+
+    prev_roi = prev_gray[y1:y2, x1:x2]
+    curr_roi = gray[y1:y2, x1:x2]
+
+    if prev_roi.size == 0 or curr_roi.size == 0:
+        prev_gray = gray
+        prev_time = now
+        return 0.0
+
+    p0 = cv2.goodFeaturesToTrack(prev_roi, maxCorners=80, qualityLevel=0.01, minDistance=7)
+    if p0 is None:
+        prev_gray = gray
+        prev_time = now
+        return 0.0
+
+    p0 += np.array([x1, y1], dtype=np.float32)
+
+    p1, st, err = cv2.calcOpticalFlowPyrLK(prev_gray, gray, p0, None)
+    if p1 is None or st is None:
+        prev_gray = gray
+        prev_time = now
+        return 0.0
+
+    good_old = p0[st == 1]
+    good_new = p1[st == 1]
+
+    if len(good_old) < 5:
+        prev_gray = gray
+        prev_time = now
+        return 0.0
+
+    displacements = np.linalg.norm(good_new - good_old, axis=1)
+    med_disp = np.median(displacements)
+
+    # Convert pixel displacement to "speed"
+    speed_kmh = (med_disp / dt) * SPEED_SCALE_KMH
+    speed_kmh = float(np.clip(speed_kmh, 0, 150))
+
+    prev_gray = gray
+    prev_time = now
+    return speed_kmh
+
+
+# ===================== HUD WITH SPEEDOMETER & ALERTS =====================
+
+def draw_speedometer(frame, speed_kmh):
+    """
+    Draw an analog + digital speedometer gauge in bottom-left corner.
+    """
+    h, w = frame.shape[:2]
+    center = (int(w*0.15), int(h*0.78))
+    radius = int(min(w, h) * 0.12)
+
+    # Outer circle
+    cv2.circle(frame, center, radius, (0, 255, 255), 2)
+    cv2.circle(frame, center, int(radius*0.7), (255, 0, 255), 1)
+
+    # Ticks (0 to 150 km/h)
+    max_speed = 150
+    start_angle = -210  # left
+    end_angle   = 30    # right
+    for s in range(0, max_speed+1, 30):
+        frac = s / max_speed
+        angle = np.deg2rad(start_angle + frac*(end_angle - start_angle))
+        x1 = int(center[0] + (radius*0.75) * np.cos(angle))
+        y1 = int(center[1] + (radius*0.75) * np.sin(angle))
+        x2 = int(center[0] + radius * np.cos(angle))
+        y2 = int(center[1] + radius * np.sin(angle))
+        cv2.line(frame, (x1,y1), (x2,y2), (0, 255, 255), 2)
+
+    # Needle
+    s_clamped = max(0, min(speed_kmh, max_speed))
+    frac = s_clamped / max_speed
+    angle = np.deg2rad(start_angle + frac*(end_angle - start_angle))
+    nx = int(center[0] + (radius*0.65) * np.cos(angle))
+    ny = int(center[1] + (radius*0.65) * np.sin(angle))
+    cv2.line(frame, center, (nx, ny), (0, 0, 255), 3)
+    cv2.circle(frame, center, 5, (0,0,0), -1)
+    cv2.circle(frame, center, 5, (0,255,255), 2)
+
+    # Digital readout
+    txt = f"{int(round(speed_kmh))} km/h"
+    cv2.putText(frame, txt, (center[0]-60, center[1]+radius+20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+    return frame
+
+def draw_turn_arrows(overlay, steering):
+    """
+    Big left/right arrows when needed.
+    """
+    h, w = overlay.shape[:2]
+    arrow_color = (0, 255, 255)
+
+    if steering == "Left":
+        pts = np.array([
+            [int(w*0.15), int(h*0.5)],
+            [int(w*0.25), int(h*0.45)],
+            [int(w*0.25), int(h*0.55)]
+        ], np.int32)
+        cv2.fillPoly(overlay, [pts], arrow_color)
+
+    elif steering == "Right":
+        pts = np.array([
+            [int(w*0.85), int(h*0.5)],
+            [int(w*0.75), int(h*0.45)],
+            [int(w*0.75), int(h*0.55)]
+        ], np.int32)
+        cv2.fillPoly(overlay, [pts], arrow_color)
+
+    return overlay
+
+def draw_lane_departure_glow(overlay, offset_m):
+    """
+    Blue glow along lane edge if car offset is large.
+    """
+    if offset_m is None:
+        return overlay
+
+    h, w = overlay.shape[:2]
+    glow_width = int(w * 0.06)
+    glow_layer = np.zeros_like(overlay)
+
+    if offset_m > 0.4:
+        # drifting to right - glow right edge
+        cv2.rectangle(glow_layer, (w-glow_width, 0), (w, h), (255, 0, 0), -1)
+    elif offset_m < -0.4:
+        # drifting to left
+        cv2.rectangle(glow_layer, (0, 0), (glow_width, h), (255, 0, 0), -1)
+    else:
+        return overlay
+
+    overlay = cv2.addWeighted(overlay, 0.75, glow_layer, 0.25, 0)
+    return overlay
+
+def draw_collision_flash(overlay, close_vehicle):
+    """
+    Red flash overlay when collision risk.
+    """
+    if not close_vehicle:
+        return overlay
+
+    flash_layer = np.zeros_like(overlay)
+    flash_layer[:, :, 2] = 255  # red channel
+    overlay = cv2.addWeighted(overlay, 0.5, flash_layer, 0.5, 0)
+
+    h, w = overlay.shape[:2]
+    cv2.putText(overlay, "COLLISION RISK", (int(w*0.35), int(h*0.1)),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 3)
+    return overlay
+
+def draw_tl_icon(overlay, tl_state):
+    """
+    Traffic light icon (circle) at the top center.
+    """
+    if tl_state == "NONE":
+        return overlay
+
+    h, w = overlay.shape[:2]
+    center = (w // 2, int(h * 0.18))
+    color_map = {
+        "RED": (0, 0, 255),
+        "YELLOW": (0, 255, 255),
+        "GREEN": (0, 255, 0)
+    }
+    col = color_map.get(tl_state, (200,200,200))
+
+    cv2.circle(overlay, center, 16, (50,50,50), -1)
+    cv2.circle(overlay, center, 14, col, -1)
+    cv2.putText(overlay, "TL", (center[0]-22, center[1]+32),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+    return overlay
+
+def draw_icons(overlay, pothole, ped_ahead, signs, curve_label):
+    """
+    Draw small icons: pothole, pedestrian, signs, road curve indicator.
+    """
+    h, w = overlay.shape[:2]
+
+    # Pothole icon
+    if pothole:
+        cv2.rectangle(overlay, (int(w*0.8), int(h*0.7)), (int(w*0.96), int(h*0.78)), (0,128,255), 2)
+        cv2.putText(overlay, "POTHOLE", (int(w*0.81), int(h*0.75)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,128,255), 2)
+
+    # Pedestrian ahead icon
+    if ped_ahead:
+        cv2.rectangle(overlay, (int(w*0.02), int(h*0.7)), (int(w*0.22), int(h*0.78)), (0,255,128), 2)
+        cv2.putText(overlay, "PEDESTRIAN", (int(w*0.03), int(h*0.75)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,128), 2)
+
+    # Road curve indicator text
+    curve_text = "STRAIGHT"
+    if "Left" in (curve_label or ""):
+        curve_text = "CURVE LEFT"
+    elif "Right" in (curve_label or ""):
+        curve_text = "CURVE RIGHT"
+
+    cv2.putText(overlay, curve_text, (int(w*0.38), int(h*0.2)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+    # Traffic sign overlay short label
+    if signs:
+        first_sign = signs[0][:10]
+        cv2.rectangle(overlay, (int(w*0.4), int(h*0.24)), (int(w*0.6), int(h*0.30)), (255,140,0), 1)
+        cv2.putText(overlay, f"SIGN: {first_sign}", (int(w*0.41), int(h*0.275)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,140,0), 2)
+
+    return overlay
+
+def draw_hud(frame, steering, curve_label, offset_m,
+             congestion, tl_state, pothole, zebra, signs,
+             speed_kmh, close_vehicle, ped_ahead):
+    h, w = frame.shape[:2]
+    cx, cy = w // 2, int(h * 0.65)
+
+    # Dim for HUD look
+    overlay = cv2.addWeighted(frame, 0.85, np.zeros_like(frame), 0.15, 0)
+
+    # Circular HUD
+    radius_outer = int(min(w, h) * 0.32)
+    radius_inner = int(radius_outer * 0.7)
+    cv2.circle(overlay, (cx, cy), radius_outer, (0, 255, 255), 2)
+    cv2.circle(overlay, (cx, cy), radius_inner, (255, 0, 255), 1)
+
+    cv2.line(overlay, (cx - radius_inner, cy), (cx + radius_inner, cy), (0, 255, 255), 1)
+    cv2.line(overlay, (cx, cy - radius_inner), (cx, cy + radius_inner), (0, 255, 255), 1)
+
+    # Horizon line
+    cv2.line(overlay,
+             (cx - radius_outer, cy + int(radius_outer * 0.4)),
+             (cx + radius_outer, cy + int(radius_outer * 0.4)),
+             (255, 140, 0), 2)
+
+    # Tick marks
+    for angle_deg in range(0, 360, 30):
+        rad = np.deg2rad(angle_deg)
+        x1 = int(cx + radius_inner * np.cos(rad))
+        y1 = int(cy + radius_inner * np.sin(rad))
+        x2 = int(cx + (radius_outer - 10) * np.cos(rad))
+        y2 = int(cy + (radius_outer - 10) * np.sin(rad))
+        cv2.line(overlay, (x1,y1), (x2,y2), (0, 200, 255), 1)
+
+    panel_w, panel_h = 260, 130
+
+    # Left holo panel: Lane info
+    lp_x1, lp_y1 = 20, 20
+    lp_x2, lp_y2 = lp_x1 + panel_w, lp_y1 + panel_h
+    cv2.rectangle(overlay, (lp_x1, lp_y1), (lp_x2, lp_y2), (0,255,255), 1)
+    cv2.rectangle(overlay, (lp_x1+3, lp_y1+3), (lp_x2-3, lp_y2-3), (255,0,255), 1)
+    cv2.putText(overlay, "LANE STATUS", (lp_x1+10, lp_y1+25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    off_text = "N/A" if offset_m is None else f"{offset_m:+.2f} m"
+    cv2.putText(overlay, f"Offset: {off_text}", (lp_x1+10, lp_y1+55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1)
+    cv2.putText(overlay, f"Steering: {steering}", (lp_x1+10, lp_y1+80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1)
+    cv2.putText(overlay, f"Road: {curve_label}", (lp_x1+10, lp_y1+105),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1)
+
+    # Right holo panel: Environment
+    rp_x2, rp_y1 = w - 20, 20
+    rp_x1, rp_y2 = rp_x2 - panel_w, rp_y1 + panel_h
+    cv2.rectangle(overlay, (rp_x1, rp_y1), (rp_x2, rp_y2), (0,255,255), 1)
+    cv2.rectangle(overlay, (rp_x1+3, rp_y1+3), (rp_x2-3, rp_y2-3), (255,0,255), 1)
+    cv2.putText(overlay, "ENVIRONMENT", (rp_x1+10, rp_y1+25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+    cv2.putText(overlay, f"Congestion: {congestion}", (rp_x1+10, rp_y1+55),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1)
+    cv2.putText(overlay, f"TL: {tl_state}", (rp_x1+10, rp_y1+80),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1)
+    cv2.putText(overlay, f"Pothole: {'YES' if pothole else 'NO'}", (rp_x1+10, rp_y1+105),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1)
+
+    # Bottom status bar like FSD
+    bc_y = h - 28
+    cv2.rectangle(overlay, (int(w*0.05), bc_y-18), (int(w*0.95), bc_y+8),
+                  (10,10,10), -1)
+    cv2.rectangle(overlay, (int(w*0.05), bc_y-18), (int(w*0.95), bc_y+8),
+                  (0,255,255), 1)
+
+    signs_text = " | ".join(signs[:3]) if signs else "No signs"
+    cv2.putText(overlay, f"Signs: {signs_text}", (int(w*0.06), bc_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
+    # Add lane departure glow
+    overlay = draw_lane_departure_glow(overlay, offset_m)
+
+    # Add big turn arrows
+    overlay = draw_turn_arrows(overlay, steering)
+
+    # Traffic light icon
+    overlay = draw_tl_icon(overlay, tl_state)
+
+    # Icons: pothole, pedestrian, signs, curve
+    overlay = draw_icons(overlay, pothole, ped_ahead, signs, curve_label)
+
+    # Speedometer on top of overlay
+    overlay = draw_speedometer(overlay, speed_kmh)
+
+    # Collision red flash on very close vehicle
+    overlay = draw_collision_flash(overlay, close_vehicle)
+
+    return overlay
+
+
+# ===================== GUI APP =====================
+
+class FSDHudApp:
+    def __init__(self):
+        self.running = False
+
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        self.root = ctk.CTk()
+        self.root.title("FSD + HUD + Speedometer – Smart Road Assistant")
+        self.root.geometry("1280x720")
+
+        # Optional HUD background
+        self.bg_image = None
+        if os.path.exists(HUD_BG_PATH):
+            bg = Image.open(HUD_BG_PATH).resize((1280, 720))
+            self.bg_image = ImageTk.PhotoImage(bg)
+            self.bg_label = ctk.CTkLabel(self.root, image=self.bg_image, text="")
+            self.bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+
+        self.video_label = ctk.CTkLabel(self.root, text="")
+        self.video_label.pack(pady=10)
+
+        bottom = ctk.CTkFrame(self.root)
+        bottom.pack(fill="x", pady=5)
+
+        self.start_btn = ctk.CTkButton(bottom, text="▶ Start", width=130, command=self.start)
+        self.start_btn.pack(side="left", padx=15, pady=5)
+
+        self.stop_btn = ctk.CTkButton(bottom, text="⏹ Stop", width=130, command=self.stop)
+        self.stop_btn.pack(side="left", padx=15, pady=5)
+
+        self.status_label = ctk.CTkLabel(self.root, text="Status: Idle", font=("Consolas", 14))
+        self.status_label.pack(pady=5)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.mainloop()
+
+    def start(self):
+        if not self.running:
+            self.running = True
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+
+    def on_close(self):
+        self.running = False
+        time.sleep(0.2)
+        self.root.destroy()
+
+    def loop(self):
+        cap = cv2.VideoCapture(1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+        while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+
+            # 1) Speed estimation (use original frame)
+            speed_kmh = estimate_speed_kmh(frame)
+
+            # 2) Lane detection
+            lane_frame, steering, curve_label, offset_m = lane_pipeline(frame)
+
+            # 3) Vehicles, pedestrians, lights (+ collision risk)
+            lane_frame, counts, tl_boxes, close_vehicle = detect_main_objects(lane_frame)
+            tl_state = classify_tl_state(lane_frame, tl_boxes)
+
+            # 4) Potholes, zebra, signs
+            lane_frame, pothole_found = detect_potholes(lane_frame)
+            lane_frame, zebra_found   = detect_zebra(lane_frame)
+            lane_frame, signs_list    = detect_signs(lane_frame)
+
+            congestion = get_congestion_level(counts["vehicles"])
+            ped_ahead = counts["pedestrians"] > 0
+
+            # ------------ VOICE ALERTS ------------
+            # Lane departure (left or right)
+            # ------------ VOICE ALERTS ------------
+            # Lane direction speech
+            if steering == "Left":
+                speak_alert("Turn left")
+            elif steering == "Right":
+                speak_alert("Turn right")
+            else:
+                speak_alert("Go straight")
+
+            # Pedestrian ahead
+            if ped_ahead:
+                speak_alert("Pedestrian ahead")
+
+            # Pothole
+            if pothole_found:
+                speak_alert("Pothole detected")
+
+            # Zebra crossing
+            if zebra_found:
+                speak_alert("Zebra crossing detected")
+
+            # Red light
+            if tl_state == "RED":
+                speak_alert("Red light!")
+
+            # Collision risk (very close vehicle)
+            if close_vehicle:
+                speak_alert("Collision risk ahead")
+
+            # 5) HUD overlay (with speedometer + alerts)
+            hud_frame = draw_hud(
+                lane_frame, steering, curve_label, offset_m,
+                congestion, tl_state, pothole_found, zebra_found, signs_list,
+                speed_kmh, close_vehicle, ped_ahead
+            )
+
+            # Info line
+            offset_text = "N/A" if offset_m is None else f"{offset_m:+.2f}m"
+            info = (
+                f"Speed: {int(round(speed_kmh))} km/h  |  Steering: {steering} ({curve_label})  |  "
+                f"Offset: {offset_text}  |  Veh: {counts['vehicles']}  |  Ped: {counts['pedestrians']}  |  "
+                f"Cong: {congestion}  |  TL: {tl_state}  |  "
+                f"Pothole: {'YES' if pothole_found else 'NO'}  |  Zebra: {'YES' if zebra_found else 'NO'}"
+            )
+            self.status_label.configure(text=info)
+
+            # Show
+            rgb = cv2.cvtColor(hud_frame, cv2.COLOR_BGR2RGB)
+            img = ImageTk.PhotoImage(Image.fromarray(rgb))
+            self.video_label.configure(image=img)
+            self.video_label.image = img
+
+        cap.release()
+
+
+if __name__ == "__main__":
+    FSDHudApp()
