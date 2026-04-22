@@ -1,0 +1,11 @@
+opencv-python
+numpy
+customtkinter
+Pillow
+ultralytics
+pyttsx3opencv-python
+numpy
+customtkinter
+Pillow
+ultralytics
+pyttsx3
